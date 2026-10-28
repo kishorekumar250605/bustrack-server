@@ -32,6 +32,9 @@ const buses = {}; // { busId: { crowd, trafficManual, trafficManualAt, trafficAu
 const clients = new Set();
 const qrTokens = new Map(); // token -> { busId, exp }
 const tickets = new Map(); // id -> ticket
+const shownTickets = new Map(); // busId -> ticketed count last sent to phones
+const onboard = new Map(); // busId -> Set of ticket ids whose passengers are still on the bus
+const MAX_TICKETS = MAX; // one passenger can take any number of tickets, up to the bus capacity
 const ticketByOwner = new Map(); // "mobile|busId" -> id
 const sosList = [];
 
@@ -99,8 +102,23 @@ function effectiveTraffic(b, now = Date.now()) {
   if (b.trafficAuto && now - b.trafficAutoAt < AUTO_TRAFFIC_MS) return b.trafficAuto;
   return b.trafficManual;
 }
-function view(b, now = Date.now()) {
-  const o = { crowd: b.crowd, traffic: effectiveTraffic(b, now), deviation: b.deviation };
+// Passengers with a ticket who have not yet reached their stop (every ticket counts as many people as it has seats)
+function ticketed(id, now = Date.now()) {
+  const set = onboard.get(id);
+  if (!set) return 0;
+  let n = 0;
+  for (const tid of set) {
+    const tk = tickets.get(tid);
+    if (!tk || !tk.dropAt || tk.dropAt <= now || tk.expiresAt <= now) set.delete(tid);
+    else n += tk.qty;
+  }
+  if (!set.size) onboard.delete(id);
+  return n;
+}
+// crowd on the bus = tickets of passengers who are still riding (automatic; the conductor does not set it)
+function view(b, now = Date.now(), id = '') {
+  const t = id ? ticketed(id, now) : 0;
+  const o = { crowd: Math.min(MAX, t), ticketed: t, traffic: effectiveTraffic(b, now), deviation: b.deviation };
   if (b.gps) {
     o.gps = { lat: b.gps.lat, lon: b.gps.lon };
     o.gpsAge = now - b.gps.t;
@@ -109,11 +127,14 @@ function view(b, now = Date.now()) {
 }
 function allViews() {
   const out = {};
-  for (const id of Object.keys(buses)) out[id] = view(buses[id]);
+  for (const id of Object.keys(buses)) out[id] = view(buses[id], Date.now(), id);
   return out;
 }
 function pushBus(id) {
-  broadcast({ type: 'bus', busId: id, ...view(buses[id]) });
+  const v = view(buses[id], Date.now(), id);
+  if (v.ticketed) shownTickets.set(id, v.ticketed);
+  else shownTickets.delete(id);
+  broadcast({ type: 'bus', busId: id, ...v });
 }
 
 // ---------- Firebase login check (no packages: uses Google's public certificates) ----------
@@ -271,8 +292,8 @@ function onSet(conn, m) {
   if (typeof m.busId !== 'string' || m.busId.length > 40) return;
   if (!canControl(conn, m.busId)) return;
   const bus = buses[m.busId] || (buses[m.busId] = blank());
-  const before = JSON.stringify(view(bus));
-  if (Number.isInteger(m.crowd)) bus.crowd = Math.max(0, Math.min(MAX, m.crowd));
+  const before = JSON.stringify(view(bus, Date.now(), m.busId));
+  // crowd is automatic: it comes only from tickets, so a conductor's crowd value is ignored
   if (TRAFFIC.includes(m.traffic)) {
     bus.trafficManual = m.traffic;
     bus.trafficManualAt = Date.now();
@@ -283,7 +304,7 @@ function onSet(conn, m) {
     fetchTraffic(m.busId);
   }
   // a GPS fix alone is still sent (passengers use its time); other fields only when they changed
-  if (m.gps || JSON.stringify(view(bus)) !== before) pushBus(m.busId);
+  if (m.gps || JSON.stringify(view(bus, Date.now(), m.busId)) !== before) pushBus(m.busId);
 }
 
 function issueTicket(conn, m) {
@@ -294,14 +315,15 @@ function issueTicket(conn, m) {
   if (SECURE && !conn.verified) return { ok: false, reason: 'login' };
   const key = mobile + '|' + m.busId;
   const have = ticketByOwner.get(key);
-  if (have && tickets.get(have) && tickets.get(have).expiresAt > Date.now()) {
+  const old = have && tickets.get(have);
+  if (old && old.expiresAt > Date.now() && (!old.dropAt || old.dropAt > Date.now())) {
     return { ok: true, ticket: tickets.get(have) }; // same passenger, same bus: same ticket
   }
   const now = Date.now();
   const ticket = {
     id: 'T' + crypto.randomBytes(4).toString('hex').toUpperCase(),
     busId: m.busId, owner: mobile, name: clean(conn.name || m.name, 60),
-    issuedAt: now, expiresAt: now + TICKET_LIFE_MS, from: '', to: '', fare: 0,
+    issuedAt: now, expiresAt: now + TICKET_LIFE_MS, from: '', to: '', fare: 0, qty: 1, dropAt: 0,
   };
   tickets.set(ticket.id, ticket);
   ticketByOwner.set(key, ticket.id);
@@ -342,6 +364,15 @@ function onMessage(conn, text) {
       tk.from = clean(m.from, 80);
       tk.to = clean(m.to, 80);
       tk.fare = isNum(m.fare) ? Math.round(m.fare) : tk.fare;
+      if (Number.isInteger(m.qty)) tk.qty = Math.max(1, Math.min(MAX_TICKETS, m.qty));
+      // seats are taken from now until the ride to the destination stop is over
+      if (isNum(m.ride) && m.ride >= 0 && m.ride <= 360) {
+        tk.dropAt = Date.now() + m.ride * 60000;
+        if (!onboard.has(tk.busId)) onboard.set(tk.busId, new Set());
+        onboard.get(tk.busId).add(tk.id);
+        if (!buses[tk.busId]) buses[tk.busId] = blank();
+        pushBus(tk.busId);
+      }
     }
   } else if (m.type === 'sos') {
     if (!rateOk(conn, 'sos', 5, 60000)) return reply({ type: 'sos', ok: false });
@@ -420,6 +451,19 @@ server.on('upgrade', (req, socket) => {
   socket.on('error', drop);
 });
 
+// seats are given back when passengers reach their stop: tell every phone when the count on a bus changes
+function refreshCrowd() {
+  for (const id of new Set([...onboard.keys(), ...shownTickets.keys()])) {
+    const n = ticketed(id);
+    if ((shownTickets.get(id) || 0) !== n) {
+      if (n) shownTickets.set(id, n);
+      else shownTickets.delete(id);
+      if (buses[id]) pushBus(id);
+    }
+  }
+}
+setInterval(refreshCrowd, 10000);
+
 // keep connections alive through hosting proxies that close idle sockets
 setInterval(() => {
   for (const c of clients) if (c.writable) c.write(frame(9, Buffer.alloc(0)));
@@ -437,4 +481,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { server, verifyIdToken, trafficFromSpeeds, effectiveTraffic, buses };
+module.exports = { server, verifyIdToken, trafficFromSpeeds, effectiveTraffic, buses, refreshCrowd };
