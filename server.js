@@ -36,7 +36,11 @@ const shownTickets = new Map(); // busId -> ticketed count last sent to phones
 const onboard = new Map(); // busId -> Set of ticket ids whose passengers are still on the bus
 const MAX_TICKETS = MAX; // one passenger can take any number of tickets, up to the bus capacity
 const ticketByOwner = new Map(); // "mobile|busId" -> id
-const sosList = [];
+const sosList = []; // every emergency (newest first)
+const incidents = new Map(); // id -> emergency record
+const contactsByMobile = new Map(); // passenger mobile -> up to 3 family numbers
+const TRAIL_MAX = 500;
+const TRACK_KEEP_MS = 60 * 60 * 1000; // a tracking link works for 1 hour after the emergency is closed
 
 const blank = () => ({
   crowd: 0, trafficManual: 'Low', trafficManualAt: 0, trafficAuto: null, trafficAutoAt: 0,
@@ -110,7 +114,7 @@ function ticketed(id, now = Date.now()) {
   for (const tid of set) {
     const tk = tickets.get(tid);
     if (!tk || !tk.dropAt || tk.dropAt <= now || tk.expiresAt <= now) set.delete(tid);
-    else n += tk.qty;
+    else if (!tk.startAt || tk.startAt <= now) n += tk.qty; // an online booking counts only after the bus reaches its From stop
   }
   if (!set.size) onboard.delete(id);
   return n;
@@ -184,11 +188,14 @@ async function verifyIdToken(token, certs) {
 }
 
 // ---------- SMS for SOS (Twilio, optional) ----------
-function sendSms(text) {
+function sendSms(text, extra = []) {
   const sid = process.env.TWILIO_SID;
   const tok = process.env.TWILIO_TOKEN;
   const from = process.env.TWILIO_FROM;
-  const numbers = (process.env.SOS_NUMBERS || '').split(',').map((x) => x.trim()).filter(Boolean);
+  const numbers = [
+    ...(process.env.SOS_NUMBERS || '').split(',').map((x) => x.trim()).filter(Boolean),
+    ...extra.map((x) => '+91' + x),
+  ];
   if (!sid || !tok || !from || !numbers.length) return;
   for (const to of numbers) {
     const body = new URLSearchParams({ To: to, From: from, Body: text }).toString();
@@ -358,6 +365,29 @@ function onMessage(conn, text) {
     if (!rateOk(conn, 'claim', 20, 60000)) return reply({ type: 'ticket', ok: false, reason: 'slow' });
     const r = issueTicket(conn, { ...m, busId: clean(m.busId, 40), token: clean(m.token, 20) });
     reply({ type: 'ticket', ...r });
+  } else if (m.type === 'book') {
+    // online booking: no conductor QR needed. The ticket has its own QR; its seats count from the time the bus reaches the From stop
+    if (!rateOk(conn, 'book', 10, 60000)) return reply({ type: 'ticket', ok: false, reason: 'slow' });
+    if (SECURE && !conn.verified) return reply({ type: 'ticket', ok: false, reason: 'login' });
+    const busId = clean(m.busId, 40);
+    const qty = Number.isInteger(m.qty) ? Math.max(1, Math.min(MAX_TICKETS, m.qty)) : 1;
+    const wait = isNum(m.wait) && m.wait >= 0 && m.wait <= 360 ? m.wait : 0;
+    const ride = isNum(m.ride) && m.ride >= 0 && m.ride <= 360 ? m.ride : 0;
+    if (!busId || !clean(m.from, 80) || !clean(m.to, 80)) return reply({ type: 'ticket', ok: false, reason: 'invalid' });
+    const now = Date.now();
+    const tk = {
+      id: 'B' + crypto.randomBytes(4).toString('hex').toUpperCase(),
+      busId, owner: conn.mobile || clean(m.mobile, 10).replace(/\D/g, ''), name: clean(conn.name || m.name, 60),
+      issuedAt: now, expiresAt: now + 12 * 3600 * 1000, online: true,
+      from: clean(m.from, 80), to: clean(m.to, 80), fare: isNum(m.fare) ? Math.round(m.fare) : 0, qty,
+      startAt: now + wait * 60000, dropAt: now + (wait + ride) * 60000,
+    };
+    tickets.set(tk.id, tk);
+    if (!onboard.has(busId)) onboard.set(busId, new Set());
+    onboard.get(busId).add(tk.id);
+    if (!buses[busId]) buses[busId] = blank();
+    pushBus(busId);
+    reply({ type: 'ticket', ok: true, ticket: tk });
   } else if (m.type === 'ticket-update') {
     const tk = tickets.get(clean(m.id, 20));
     if (tk && tk.owner === conn.mobile && tk.expiresAt > Date.now()) {
@@ -377,36 +407,171 @@ function onMessage(conn, text) {
   } else if (m.type === 'sos') {
     if (!rateOk(conn, 'sos', 5, 60000)) return reply({ type: 'sos', ok: false });
     if (SECURE && !conn.verified) return reply({ type: 'sos', ok: false });
+    const mobile = clean(m.mobile || conn.mobile, 10);
     const rec = {
       id: 'S' + crypto.randomBytes(3).toString('hex').toUpperCase(),
+      token: crypto.randomBytes(8).toString('hex'),
       at: Date.now(), role: conn.role || 'passenger',
-      name: clean(m.name || conn.name, 60), mobile: clean(m.mobile || conn.mobile, 10),
-      busId: clean(m.busId || conn.busId, 40),
-      lat: isNum(m.lat) ? m.lat : null, lon: isNum(m.lon) ? m.lon : null,
+      name: clean(m.name || conn.name, 60), mobile,
+      busId: clean(m.busId || conn.busId, 40), routeNo: clean(m.routeNo, 12),
+      lat: isNum(m.lat) ? m.lat : null, lon: isNum(m.lon) ? m.lon : null, locAt: isNum(m.lat) ? Date.now() : 0,
+      trail: isNum(m.lat) ? [[m.lat, m.lon, Date.now()]] : [],
+      status: 'open', ackAt: 0, ackBy: '', resolvedAt: 0, note: '',
+      contacts: (contactsByMobile.get(mobile) || []).slice(),
     };
     sosList.unshift(rec);
     if (sosList.length > 200) sosList.pop();
-    reply({ type: 'sos', ok: true, id: rec.id });
+    incidents.set(rec.id, rec);
+    const host = conn.host || process.env.PUBLIC_HOST || '';
+    const link = host ? `https://${host}/t/${rec.id}?k=${rec.token}` : '';
+    reply({ type: 'sos', ok: true, id: rec.id, link, contacts: rec.contacts.length });
     for (const c of clients) {
       if (c.conn.role === 'conductor' && rec.busId && c.conn.busId === rec.busId) {
-        send(c, { type: 'sos-alert', ...rec });
+        send(c, { type: 'sos-alert', id: rec.id, name: rec.name, mobile: rec.mobile, busId: rec.busId, lat: rec.lat, lon: rec.lon, at: rec.at });
       }
     }
-    const where = rec.lat != null ? ` https://maps.google.com/?q=${rec.lat},${rec.lon}` : '';
-    sendSms(`RouteX SOS: ${rec.name} +91${rec.mobile} bus ${rec.busId || '-'}${where}`);
-    console.log(`SOS ${rec.id} ${rec.name} ${rec.mobile} bus=${rec.busId}`);
+    // family members and the control room get an SMS with the live tracking link (if Twilio is set up)
+    const where = rec.lat != null ? ` Location: https://maps.google.com/?q=${rec.lat},${rec.lon}` : '';
+    sendSms(`RouteX EMERGENCY: ${rec.name} +91${rec.mobile} needs help. Bus ${rec.routeNo || '-'} ${rec.busId || '-'}.${where}${link ? ' Live tracking: ' + link : ''}`, rec.contacts);
+    console.log(`SOS ${rec.id} ${rec.name} ${rec.mobile} bus=${rec.busId} family=${rec.contacts.length}`);
+  } else if (m.type === 'sos-loc') {
+    // the passenger's phone sends its position every few seconds while the emergency is open
+    const rec = incidents.get(clean(m.id, 12));
+    if (!rec || rec.mobile !== conn.mobile || rec.resolvedAt) return reply({ type: 'sos-loc', ok: false, status: rec ? rec.status : 'unknown' });
+    if (isNum(m.lat) && isNum(m.lon)) {
+      rec.lat = m.lat;
+      rec.lon = m.lon;
+      rec.locAt = Date.now();
+      rec.trail.push([m.lat, m.lon, rec.locAt]);
+      if (rec.trail.length > TRAIL_MAX) rec.trail.shift();
+    }
+    reply({ type: 'sos-loc', ok: true, status: rec.status, ackBy: rec.ackBy, note: rec.note });
+  } else if (m.type === 'sos-cancel') {
+    const rec = incidents.get(clean(m.id, 12));
+    if (rec && rec.mobile === conn.mobile && !rec.resolvedAt) {
+      rec.status = 'safe';
+      rec.resolvedAt = Date.now();
+      rec.note = 'Passenger marked themselves safe';
+    }
+    reply({ type: 'sos-cancel', ok: !!rec });
+  } else if (m.type === 'contacts-set') {
+    const list = (Array.isArray(m.contacts) ? m.contacts : [])
+      .map((x) => clean(String(x), 10).replace(/\D/g, ''))
+      .filter((x) => x.length === 10)
+      .slice(0, 3);
+    if (conn.mobile) contactsByMobile.set(conn.mobile, [...new Set(list)]);
+    reply({ type: 'contacts', ok: true, contacts: contactsByMobile.get(conn.mobile) || [] });
+  } else if (m.type === 'contacts-get') {
+    reply({ type: 'contacts', ok: true, contacts: contactsByMobile.get(conn.mobile) || [] });
   }
 }
 
-const server = http.createServer((req, res) => {
-  if (req.url && req.url.startsWith('/sos')) {
-    const key = new URL(req.url, 'http://x').searchParams.get('key');
-    if (ADMIN_KEY && key === ADMIN_KEY) {
-      res.setHeader('Content-Type', 'application/json');
-      return res.end(JSON.stringify(sosList));
+// ---------- control room (admin) and family tracking pages ----------
+const publicRec = (r) => ({
+  id: r.id, at: r.at, name: r.name, mobile: r.mobile, busId: r.busId, routeNo: r.routeNo,
+  lat: r.lat, lon: r.lon, locAt: r.locAt, status: r.status, ackAt: r.ackAt, ackBy: r.ackBy,
+  resolvedAt: r.resolvedAt, note: r.note, family: r.contacts.length,
+});
+const json = (res, code, obj) => {
+  res.statusCode = code;
+  res.setHeader('Content-Type', 'application/json');
+  res.end(JSON.stringify(obj));
+};
+const adminOk = (key) => ADMIN_KEY && key === ADMIN_KEY;
+function readBody(req, cb) {
+  let b = '';
+  req.on('data', (c) => {
+    b += c;
+    if (b.length > 5000) req.destroy();
+  });
+  req.on('end', () => {
+    try {
+      cb(JSON.parse(b || '{}'));
+    } catch (e) {
+      cb({});
     }
+  });
+}
+const PAGE_HEAD = '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">';
+const ADMIN_PAGE = PAGE_HEAD + `<title>RouteX Control Room</title><style>body{font-family:Arial,sans-serif;background:#efe3c8;margin:0;padding:14px;color:#2e2015}h1{margin:0 0 10px}.c{background:#faf3e0;border:2px solid #2e2015;border-radius:6px;padding:12px;margin-bottom:10px}.open{border-color:#9b2c2c}.t{font-weight:bold;font-size:18px}.b{margin:6px 6px 0 0;padding:8px 12px;border:0;border-radius:4px;background:#3b2a1e;color:#fff;font-weight:bold;cursor:pointer}.r{background:#4f6f3a}small{color:#7a6650}input{padding:6px;width:60%}</style></head><body><h1>RouteX Control Room</h1><div id="l">Loading...</div><script>
+var K=new URLSearchParams(location.search).get('key');
+function el(t,x,c){var e=document.createElement(t);if(x)e.textContent=x;if(c)e.className=c;return e}
+function act(p,id,note){fetch('/admin/'+p,{method:'POST',body:JSON.stringify({key:K,id:id,note:note||'',by:'Control room'})}).then(load)}
+function load(){fetch('/admin/data?key='+encodeURIComponent(K)).then(function(r){return r.json()}).then(function(d){var L=document.getElementById('l');L.textContent='';if(!d.length)L.textContent='No emergencies.';d.forEach(function(x){var c=el('div','', 'c'+(x.status==='open'?' open':''));c.appendChild(el('div',x.name+'  +91'+x.mobile+'  ['+x.status.toUpperCase()+']','t'));c.appendChild(el('div','Bus '+(x.routeNo||'-')+'  '+(x.busId||'-')+'   Family alerted: '+x.family));c.appendChild(el('small','Started '+new Date(x.at).toLocaleTimeString()+(x.locAt?'   Last location '+Math.round((Date.now()-x.locAt)/1000)+' s ago':'   No location')+(x.ackBy?'   Acknowledged by '+x.ackBy:'')+(x.note?'   Note: '+x.note:'')));c.appendChild(el('br'));if(x.lat!=null){var a=el('a','Open live location');a.href='https://maps.google.com/?q='+x.lat+','+x.lon;a.target='_blank';c.appendChild(a)}c.appendChild(el('br'));if(!x.resolvedAt){if(x.status==='open'){var b1=el('button','Acknowledge','b');b1.onclick=function(){act('ack',x.id)};c.appendChild(b1)}var n=el('input');n.placeholder='Note (help sent, police called...)';c.appendChild(n);var b2=el('button','Resolve and close','b r');b2.onclick=function(){act('resolve',x.id,n.value)};c.appendChild(b2)}L.appendChild(c)})})}
+load();setInterval(load,5000);
+</script></body></html>`;
+const TRACK_PAGE = PAGE_HEAD + `<title>RouteX Live Tracking</title><link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"><script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script><style>body{margin:0;font-family:Arial,sans-serif}#i{padding:10px;background:#faf3e0;border-bottom:2px solid #2e2015}#m{height:calc(100vh - 90px)}</style></head><body><div id="i">Loading...</div><div id="m"></div><script>
+var p=location.pathname.split('/');var id=p[2];var k=new URLSearchParams(location.search).get('k');
+var map=L.map('m').setView([13.08,80.27],12);L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'OpenStreetMap'}).addTo(map);
+var mk=null,ln=null,first=true;
+function load(){fetch('/t/'+id+'.json?k='+k).then(function(r){return r.json()}).then(function(d){
+ var t=d.name+' | Bus '+(d.routeNo||'-')+' '+(d.busId||'-')+' | '+d.status.toUpperCase();
+ if(d.locAt)t+=' | updated '+Math.round((Date.now()-d.locAt)/1000)+' s ago';
+ document.getElementById('i').textContent=t;
+ if(d.lat!=null){var ll=[d.lat,d.lon];if(!mk)mk=L.marker(ll).addTo(map);mk.setLatLng(ll);
+  var tr=d.trail.map(function(x){return [x[0],x[1]]});if(!ln)ln=L.polyline(tr,{color:'#9b2c2c'}).addTo(map);ln.setLatLngs(tr);
+  if(first){map.setView(ll,16);first=false}}
+}).catch(function(){document.getElementById('i').textContent='This link is no longer active.'})}
+load();setInterval(load,5000);
+</script></body></html>`;
+
+const server = http.createServer((req, res) => {
+  const u = new URL(req.url || '/', 'http://x');
+  const path = u.pathname;
+  if (path === '/sos') {
+    if (adminOk(u.searchParams.get('key'))) return json(res, 200, sosList.map(publicRec));
     res.statusCode = 403;
     return res.end('no');
+  }
+  if (path === '/admin') {
+    if (!adminOk(u.searchParams.get('key'))) {
+      res.statusCode = 403;
+      return res.end('Set ADMIN_KEY on the server and open /admin?key=YOUR_KEY');
+    }
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    return res.end(ADMIN_PAGE);
+  }
+  if (path === '/admin/data') {
+    if (!adminOk(u.searchParams.get('key'))) return json(res, 403, { error: 'no' });
+    return json(res, 200, sosList.map(publicRec));
+  }
+  if ((path === '/admin/ack' || path === '/admin/resolve') && req.method === 'POST') {
+    return readBody(req, (b) => {
+      if (!adminOk(b.key)) return json(res, 403, { error: 'no' });
+      const rec = incidents.get(String(b.id || ''));
+      if (!rec) return json(res, 404, { error: 'unknown' });
+      const now = Date.now();
+      if (path === '/admin/ack' && rec.status === 'open') {
+        rec.status = 'acknowledged';
+        rec.ackAt = now;
+        rec.ackBy = clean(b.by || 'Control room', 40);
+      } else if (path === '/admin/resolve' && !rec.resolvedAt) {
+        rec.status = 'resolved';
+        rec.resolvedAt = now;
+        rec.note = clean(b.note, 120);
+        if (!rec.ackAt) {
+          rec.ackAt = now;
+          rec.ackBy = clean(b.by || 'Control room', 40);
+        }
+      }
+      json(res, 200, publicRec(rec));
+    });
+  }
+  const t = path.match(/^\/t\/(S[0-9A-F]{6})(\.json)?$/);
+  if (t) {
+    const rec = incidents.get(t[1]);
+    const k = u.searchParams.get('k');
+    const dead = !rec || rec.token !== k || (rec.resolvedAt && Date.now() - rec.resolvedAt > TRACK_KEEP_MS);
+    if (t[2]) {
+      if (dead) return json(res, 404, { error: 'gone' });
+      return json(res, 200, { ...publicRec(rec), trail: rec.trail });
+    }
+    if (dead) {
+      res.statusCode = 404;
+      return res.end('This tracking link is no longer active.');
+    }
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    return res.end(TRACK_PAGE);
   }
   res.end('RouteX live server');
 });
@@ -421,7 +586,7 @@ server.on('upgrade', (req, socket) => {
       'Connection: Upgrade\r\n' +
       `Sec-WebSocket-Accept: ${accept}\r\n\r\n`
   );
-  const conn = { socket, role: 'passenger', busId: '', mobile: '', name: '', verified: false, rate: {} };
+  const conn = { socket, role: 'passenger', busId: '', mobile: '', name: '', verified: false, rate: {}, host: req.headers.host || '' };
   socket.conn = conn;
   clients.add(socket);
   send(socket, { type: 'state', buses: allViews() });
